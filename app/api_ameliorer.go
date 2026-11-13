@@ -1,0 +1,134 @@
+package main
+
+// "Improve with Claude": rewrites a request (new project or queued request) into a clearer, richer
+// version, without changing what the user wants. The interface keeps the user's version so that
+// they can go back to it.
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+	"unicode/utf8"
+)
+
+const consigneAmeliorer = `You improve a project request written by a user for an autonomous AI developer (Claude Code, driven by a tool called Athanor, which plans the project into milestones and builds it alone).
+Rewrite the request so that it is clear, complete and actionable, WITHOUT changing what the user wants:
+- Keep every requirement, constraint, name, number and technology the user gave. Never contradict or drop them.
+- Make the implicit explicit: the goal, who it is for, the platform(s), the main features (as a list), the content, the look and feel, the constraints, and what "done" looks like.
+- When something important is unspecified, add a sensible default and mark it with "(suggestion)" so the user can spot it. Do not add scope the request does not call for.
+- Do not choose technologies unless the user did: the developer chooses.
+- Plain Markdown with short headings and bullet lists, about 400 words at most.
+- Write in the same language as the request.
+- Output ONLY the improved request: no preamble, no comment, no code fence around it.
+
+The request:
+<<<
+%s
+>>>`
+
+const consigneAmeliorerAgent = `You improve the standing instructions of a sub-agent for an autonomous AI developer (Claude Code, driven by a tool called Athanor). The project lead calls this sub-agent with the Task tool for a precise piece of work; the sub-agent starts with no memory, reads these instructions, does the work alone (nobody answers its questions) and hands back a report.
+Sub-agent: %n
+When the lead uses it: %d
+Rewrite its instructions so that they are clear, complete and actionable, WITHOUT changing what the user wants it to be:
+- Keep every rule, constraint, name, tool and technology the user gave. Never contradict or drop them.
+- Structure: its role in one sentence; how it works (the steps it follows, what it reads first, the quality bar); what it must always do; what it must never do; what it hands back (a short report: done, checked, left).
+- When something important is unspecified, add a sensible default marked "(suggestion)". Do not widen its role beyond what the user describes.
+- Write it addressed to the sub-agent ("You ..."), in plain Markdown with short headings and bullet lists, about 350 words at most.
+- Write in the same language as the instructions.
+- Output ONLY the improved instructions: no preamble, no comment, no code fence around them.
+
+The instructions:
+<<<
+%s
+>>>`
+
+// one rewrite at a time: each one is a Claude session on the user's quota
+var ameliorationEnCours sync.Mutex
+
+func (s *Serveur) apiAmeliorerDemande(w http.ResponseWriter, r *http.Request) {
+	var c struct {
+		Texte       string `json:"texte"`
+		Genre       string `json:"genre"` // "" a request, "agent" a sub-agent's instructions
+		Nom         string `json:"nom"`
+		Description string `json:"description"`
+	}
+	if err := lireCorps(r, &c); err != nil || strings.TrimSpace(c.Texte) == "" {
+		s.erreur(w, http.StatusBadRequest, "Write your request first")
+		return
+	}
+	if utf8.RuneCountInString(c.Texte) > 20000 {
+		s.erreur(w, http.StatusBadRequest, "Request too long to be improved (20,000 characters at most)")
+		return
+	}
+	if !ameliorationEnCours.TryLock() {
+		s.erreur(w, http.StatusConflict, "Claude is already improving a request")
+		return
+	}
+	defer ameliorationEnCours.Unlock()
+
+	k := s.kitCourant()
+	b := make([]byte, 6)
+	_, _ = rand.Read(b)
+	nom := ".request-" + hex.EncodeToString(b) + ".txt"
+	chemin := filepath.Join(k.Journaux(), nom)
+	if err := os.MkdirAll(k.Journaux(), 0o755); err != nil {
+		s.erreur(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	consigne := strings.Replace(consigneAmeliorer, "%s", strings.TrimSpace(c.Texte), 1)
+	if c.Genre == "agent" {
+		// one pass over the template: a "%s" typed by the user is never taken for a placeholder
+		consigne = strings.NewReplacer("%n", court(strings.TrimSpace(c.Nom), 40), "%d", court(strings.TrimSpace(c.Description), 400),
+			"%s", strings.TrimSpace(c.Texte)).Replace(consigneAmeliorerAgent)
+	}
+	if err := os.WriteFile(chemin, []byte(consigne), 0o600); err != nil {
+		s.erreur(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	defer os.Remove(chemin)
+
+	// one turn in an empty folder (athanor ameliorer); the request travels through a file (no quoting issue)
+	cmd := commandeKit(k, "ameliorer", k.Racine, chemin)
+	cacherFenetre(cmd)
+	var erreurs strings.Builder
+	cmd.Stderr = &erreurs
+	fini := make(chan struct{})
+	var sortie []byte
+	var err error
+	go func() { sortie, err = cmd.Output(); close(fini) }()
+	select {
+	case <-fini:
+	case <-time.After(260 * time.Second):
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		s.erreur(w, http.StatusGatewayTimeout, "Claude took too long: try again in a moment")
+		return
+	}
+	texte := strings.TrimSpace(strings.ReplaceAll(string(sortie), "\r\n", "\n"))
+	if strings.HasPrefix(texte, "```") { // a code fence around the whole answer, despite the instruction
+		if i := strings.Index(texte, "\n"); i >= 0 {
+			texte = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(texte[i+1:]), "```"))
+		}
+	}
+	if err != nil || texte == "" {
+		detail := strings.TrimSpace(erreurs.String())
+		if detail == "" {
+			detail = texte
+		}
+		if i := strings.LastIndex(detail, "\n"); i >= 0 {
+			detail = detail[i+1:]
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusBadGateway)
+		_ = json.NewEncoder(w).Encode(map[string]any{"erreur_key": "Claude could not improve the request: {0}", "args": []string{court(detail, 200)}})
+		return
+	}
+	s.ecrireJSON(w, map[string]string{"texte": texte})
+}
