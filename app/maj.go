@@ -34,13 +34,13 @@ func init() {
 	enregistrerCommande("mise-a-jour", "mise-a-jour KIT PID: run by the new executable an update downloaded: waits for the application PID to close, brings the tool folder KIT to its version and opens Athanor again", lancerMiseAJour)
 }
 
-// apiDerniereVersion: GitHub's latest release of Athanor (ATHANOR_MAJ_API: the test harness's stand-in,
-// never set by the application).
+// apiDerniereVersion: where the latest release is read (ATHANOR_MAJ_API). Empty by default: this copy
+// never downloads and runs a program from a repository its user does not control.
 func apiDerniereVersion() string {
 	if u := os.Getenv("ATHANOR_MAJ_API"); u != "" {
 		return u
 	}
-	return "https://api.github.com/repos/Aprilox/Athanor/releases/latest"
+	return ""
 }
 
 // nomFichierMaj: the release's file for this system and processor (the one a user downloads; on the Mac,
@@ -119,6 +119,9 @@ var (
 
 // majPossible: whether this executable can update the kit k (and why not).
 func majPossible(k Kit) (bool, string) {
+	if apiDerniereVersion() == "" {
+		return false, "source"
+	}
 	if !kitEmbarque() {
 		return false, "source"
 	}
