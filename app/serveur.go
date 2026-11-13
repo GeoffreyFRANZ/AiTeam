@@ -3,6 +3,7 @@ package main
 // Local HTTP server: shared state, request protection (same origin, locking), routes.
 
 import (
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -28,6 +29,9 @@ type Serveur struct {
 	verifs       []*Verif // WSL mode
 	verifsNatif  []*Verif // native Windows mode
 	session      string   // session token when a password is set ("" = locked)
+	mdpMu        sync.Mutex
+	essaisMdp    int
+	blocageMdp   time.Time
 	csrf         string
 	cleAcces     string               // cookie of the windows Athanor opened (acces.go); empty = no check (tests)
 	ouvertures   map[string]time.Time // single-use window addresses
@@ -100,9 +104,58 @@ func aleatoire(n int) string {
 	return hex.EncodeToString(b)
 }
 
-func hacher(sel, mdp string) string {
+const (
+	prefixeMdp        = "pbkdf2-sha256$"
+	iterationsMdp     = 600000
+	essaisMdpLocalMax = 5
+	blocageMdpLocal   = time.Minute
+	blocageMdpMax     = 15 * time.Minute
+)
+
+func deriverMdp(sel, mdp string, iterations int) string {
+	k, err := pbkdf2.Key(sha256.New, mdp, []byte(sel), iterations, 32)
+	if err != nil {
+		return ""
+	}
+	return prefixeMdp + strconv.Itoa(iterations) + "$" + hex.EncodeToString(k)
+}
+
+func hacher(sel, mdp string) string { return deriverMdp(sel, mdp, iterationsMdp) }
+
+func hacherAncien(sel, mdp string) string {
 	h := sha256.Sum256([]byte(sel + ":" + mdp))
 	return hex.EncodeToString(h[:])
+}
+
+func mdpValide(sel, mdp, hash string) (ok, ancien bool) {
+	reste, moderne := strings.CutPrefix(hash, prefixeMdp)
+	if !moderne {
+		return egal(hacherAncien(sel, mdp), hash), true
+	}
+	n, _, trouve := strings.Cut(reste, "$")
+	iterations, err := strconv.Atoi(n)
+	if !trouve || err != nil || iterations < 1 || iterations > 10*iterationsMdp {
+		return false, false
+	}
+	attendu := deriverMdp(sel, mdp, iterations)
+	return attendu != "" && egal(attendu, hash), iterations < iterationsMdp
+}
+
+func (s *Serveur) attenteMdpLocal() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return time.Until(s.blocageMdp)
+}
+
+func (s *Serveur) echecMdpLocal() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.essaisMdp++
+	if s.essaisMdp < essaisMdpLocalMax {
+		return
+	}
+	attente := blocageMdpLocal << min(s.essaisMdp-essaisMdpLocalMax, 4)
+	s.blocageMdp = time.Now().Add(min(attente, blocageMdpMax))
 }
 
 func egal(a, b string) bool { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }
@@ -456,7 +509,21 @@ func (s *Serveur) apiDeverrouiller(w http.ResponseWriter, r *http.Request) {
 	}
 	time.Sleep(400 * time.Millisecond) // slows down bursts of attempts (without holding the application)
 	id := appareilDe(r)
-	if !egal(hacher(sel, c.MotDePasse), hash) {
+	s.mdpMu.Lock()
+	if id == "" {
+		if attente := s.attenteMdpLocal(); attente > 0 {
+			s.mdpMu.Unlock()
+			w.Header().Set("Retry-After", strconv.Itoa(int(attente.Seconds())+1))
+			s.erreur(w, http.StatusTooManyRequests, "Too many attempts: try again in a few minutes.")
+			return
+		}
+	}
+	bon, ancien := mdpValide(sel, c.MotDePasse, hash)
+	if !bon && id == "" {
+		s.echecMdpLocal()
+	}
+	s.mdpMu.Unlock()
+	if !bon {
 		if id == "" {
 			s.erreur(w, http.StatusUnauthorized, "Wrong password")
 			return
@@ -476,6 +543,15 @@ func (s *Serveur) apiDeverrouiller(w http.ResponseWriter, r *http.Request) {
 		s.erreur(w, http.StatusUnauthorized, "Not paired")
 		return
 	}
+	if ancien {
+		s.mu.Lock()
+		if s.config.MotDePasseHash == hash {
+			s.config.Sel = aleatoire(16)
+			s.config.MotDePasseHash = hacher(s.config.Sel, c.MotDePasse)
+			_ = ecrireConfig(s.config)
+		}
+		s.mu.Unlock()
+	}
 	if id != "" {
 		d := s.dist()
 		d.mu.Lock()
@@ -484,6 +560,7 @@ func (s *Serveur) apiDeverrouiller(w http.ResponseWriter, r *http.Request) {
 		d.mu.Unlock()
 	} else {
 		s.mu.Lock()
+		s.essaisMdp, s.blocageMdp = 0, time.Time{}
 		s.ouvrirSession(w)
 		s.mu.Unlock()
 	}
@@ -518,9 +595,11 @@ func (s *Serveur) apiMotDePasse(w http.ResponseWriter, r *http.Request) {
 	_ = lireCorps(r, &c)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.config.MotDePasseHash != "" && !egal(hacher(s.config.Sel, c.Ancien), s.config.MotDePasseHash) {
-		s.erreur(w, http.StatusUnauthorized, "Wrong current password")
-		return
+	if s.config.MotDePasseHash != "" {
+		if bon, _ := mdpValide(s.config.Sel, c.Ancien, s.config.MotDePasseHash); !bon {
+			s.erreur(w, http.StatusUnauthorized, "Wrong current password")
+			return
+		}
 	}
 	if strings.TrimSpace(c.Nouveau) == "" {
 		s.config.MotDePasseHash, s.config.Sel, s.session = "", "", ""
@@ -529,7 +608,7 @@ func (s *Serveur) apiMotDePasse(w http.ResponseWriter, r *http.Request) {
 			s.erreur(w, http.StatusBadRequest, "At least 4 characters")
 			return
 		}
-		s.config.Sel = aleatoire(8)
+		s.config.Sel = aleatoire(16)
 		s.config.MotDePasseHash = hacher(s.config.Sel, c.Nouveau)
 		s.ouvrirSession(w)
 	}
