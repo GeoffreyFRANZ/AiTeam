@@ -7,7 +7,11 @@ package main
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +24,15 @@ import (
 )
 
 const versionRTK = "v0.50.0"
+
+var sommesRTK = map[string]string{
+	"x86_64-unknown-linux-musl": "bc2b8902b0d9c796c82ef45f16ae2307e17757afeca5ee156235a3dc7bda5f89",
+	"aarch64-unknown-linux-gnu": "d1cc49dfa2cd443fc32625444b59fe616b6c80478cca210985118347174dd758",
+	"aarch64-apple-darwin":      "fe54761a9950266e3a78ddb66a8af5e067251169da306a288e0751de63d836fe",
+	"x86_64-apple-darwin":       "ac23e20024ab3c71e7f50069f8b34190aec1b2d8f0c2cc19834039b3dac73373",
+}
+
+const tailleRTKMax = 100 << 20
 
 type installation struct {
 	kit, systeme string
@@ -316,7 +329,7 @@ func (in *installation) rtk() {
 		return
 	}
 	cible := cibleRTK(runtime.GOOS, runtime.GOARCH)
-	if cible != "" && telechargerRTK("https://github.com/rtk-ai/rtk/releases/download/"+versionRTK+"/rtk-"+cible+".tar.gz", dest) == nil {
+	if cible != "" && telechargerRTK(cible, dest) == nil {
 		in.ok("RTK " + versionRTK + " installed")
 	} else {
 		in.alerte("RTK not installed: Claude will work without it.")
@@ -324,9 +337,13 @@ func (in *installation) rtk() {
 }
 
 // telechargerRTK: the archive's rtk, written aside then renamed (never half a program in place).
-func telechargerRTK(url, dest string) error {
+func telechargerRTK(cible, dest string) error {
+	somme := sommesRTK[cible]
+	if somme == "" {
+		return fmt.Errorf("no known checksum for rtk-%s", cible)
+	}
 	cl := &http.Client{Timeout: 2 * time.Minute}
-	r, err := cl.Get(url)
+	r, err := cl.Get("https://github.com/rtk-ai/rtk/releases/download/" + versionRTK + "/rtk-" + cible + ".tar.gz")
 	if err != nil {
 		return err
 	}
@@ -334,7 +351,22 @@ func telechargerRTK(url, dest string) error {
 	if r.StatusCode != 200 {
 		return fmt.Errorf("HTTP %d", r.StatusCode)
 	}
-	return extraireRTK(r.Body, dest)
+	b, err := io.ReadAll(io.LimitReader(r.Body, tailleRTKMax+1))
+	if err != nil {
+		return err
+	}
+	if len(b) > tailleRTKMax {
+		return errors.New("rtk: the archive is too large")
+	}
+	return verifierEtExtraireRTK(b, somme, dest)
+}
+
+func verifierEtExtraireRTK(archive []byte, somme, dest string) error {
+	h := sha256.Sum256(archive)
+	if !egal(hex.EncodeToString(h[:]), somme) {
+		return errors.New("rtk: the downloaded archive does not match its pinned checksum")
+	}
+	return extraireRTK(bytes.NewReader(archive), dest)
 }
 
 func extraireRTK(archive io.Reader, dest string) error {

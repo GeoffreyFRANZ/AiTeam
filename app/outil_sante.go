@@ -629,7 +629,7 @@ func reparerRTK(kit string) int {
 		return 1
 	}
 	dest := filepath.Join(kit, "system", "bin", "rtk")
-	if err := telechargerRTK("https://github.com/rtk-ai/rtk/releases/download/"+versionRTK+"/rtk-"+cible+".tar.gz", dest); err != nil {
+	if err := telechargerRTK(cible, dest); err != nil {
 		direSante("RTK download FAILED: %v", err)
 		return 1
 	}

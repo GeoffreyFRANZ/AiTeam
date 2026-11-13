@@ -53,7 +53,7 @@ func TestTelechargerRTKReseau(t *testing.T) {
 		t.Skip("ATHANOR_TEST_RESEAU not set")
 	}
 	dest := filepath.Join(t.TempDir(), "rtk")
-	if err := telechargerRTK("https://github.com/rtk-ai/rtk/releases/download/"+versionRTK+"/rtk-x86_64-unknown-linux-musl.tar.gz", dest); err != nil {
+	if err := telechargerRTK("x86_64-unknown-linux-musl", dest); err != nil {
 		t.Fatal(err)
 	}
 	if st, err := os.Stat(dest); err != nil || st.Size() < 100000 {
