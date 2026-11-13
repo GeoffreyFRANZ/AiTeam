@@ -2,6 +2,8 @@ module athanor
 
 go 1.24.7
 
+toolchain go1.26.11
+
 require (
 	github.com/ebitengine/purego v0.8.4
 	github.com/jchv/go-webview2 v0.0.0
