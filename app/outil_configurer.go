@@ -292,11 +292,11 @@ func lancerConfigurer(args []string) int {
 	sousAgents := a.reponse
 
 	// 5. Duration
-	a.titre("5. Maximum working time", "Safety stop, counted from the project's first start (quota pauses included).")
-	a.choisir(a.valeur("MAX_HOURS"), "24|1 day", "72|3 days", "168|1 week (recommended)", "336|2 weeks", "__autre__|Other (in hours)")
+	a.titre("5. Maximum working time", "Safety stop, counted from the project's first start (quota pauses included). 0: no limit.")
+	a.choisir(a.valeur("MAX_HOURS"), "24|1 day", "72|3 days", "168|1 week", "336|2 weeks", "0|No limit (recommended)", "__autre__|Other (in hours)")
 	duree := a.reponse
 	if !regexp.MustCompile(`^[0-9]+$`).MatchString(duree) {
-		duree = "168"
+		duree = "0"
 	}
 
 	// 6. RTK

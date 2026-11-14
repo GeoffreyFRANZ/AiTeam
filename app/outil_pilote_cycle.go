@@ -2018,7 +2018,7 @@ func lancerPilote(args []string) int {
 		natif:                    natif,
 		claudeBin:                claudeBin,
 		cheminClaude:             cheminClaude,
-		maxHours:                 entierReglage("MAX_HOURS", 168),
+		maxHours:                 entierReglage("MAX_HOURS", 0),
 		quotaWaitMin:             entierReglage("QUOTA_WAIT_MIN", 20),
 		errorWaitMin:             entierReglage("ERROR_WAIT_MIN", 2),
 		errorWaitMaxMin:          entierReglage("ERROR_WAIT_MAX_MIN", 60),
@@ -2483,7 +2483,7 @@ func lancerPilote(args []string) int {
 			p.terminer("Stop requested (STOP file). Delete it, then restart with start.")
 		}
 		ecouleH := (time.Now().Unix() - p.debut) / 3600
-		if ecouleH >= int64(p.maxHours) {
+		if p.maxHours > 0 && ecouleH >= int64(p.maxHours) {
 			p.terminer(fmt.Sprintf("Maximum duration reached (%d h). The work in progress is in the project folder.", p.maxHours))
 		}
 		if p.estTermine() {
